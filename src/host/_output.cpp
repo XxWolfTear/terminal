@@ -5,18 +5,14 @@
 
 #include "_output.h"
 
-#include "dbcs.h"
+#include "directio.h"
 #include "handle.h"
 #include "misc.h"
+#include "_stream.h"
 
 #include "../interactivity/inc/ServiceLocator.hpp"
-#include "../types/inc/Viewport.hpp"
 #include "../types/inc/convert.hpp"
-
-#include <algorithm>
-#include <iterator>
-
-#pragma hdrstop
+#include "../types/inc/Viewport.hpp"
 
 using namespace Microsoft::Console::Types;
 using Microsoft::Console::Interactivity::ServiceLocator;
@@ -203,6 +199,8 @@ void WriteToScreen(SCREEN_INFORMATION& screenInfo, const Viewport& region)
     LockConsole();
     auto Unlock = wil::scope_exit([&] { UnlockConsole(); });
 
+    auto& gci = ServiceLocator::LocateGlobals().getConsoleInformation();
+
     auto& screenBuffer = OutContext.GetActiveBuffer();
     const auto bufferSize = screenBuffer.GetBufferSize();
     if (!bufferSize.IsInBounds(startingCoordinate))
@@ -212,18 +210,61 @@ void WriteToScreen(SCREEN_INFORMATION& screenInfo, const Viewport& region)
 
     try
     {
-        TextAttribute useThisAttr(attribute);
-        const OutputCellIterator it(useThisAttr, lengthToWrite);
-        const auto done = screenBuffer.Write(it, startingCoordinate);
-        const auto cellsModifiedCoord = done.GetCellDistance(it);
+        if (const auto io = gci.GetVtIo(&OutContext))
+        {
+            const auto corkLock = io->Cork();
 
-        cellsModified = cellsModifiedCoord;
+            const auto w = gsl::narrow_cast<uint64_t>(bufferSize.Width());
+            const auto h = gsl::narrow_cast<uint64_t>(bufferSize.Height());
+            const auto x = gsl::narrow_cast<uint64_t>(startingCoordinate.x);
+            const auto y = gsl::narrow_cast<uint64_t>(startingCoordinate.y);
+            const auto maxOffset = w * h;
+            const auto startOffset = std::clamp<uint64_t>(y * w + x, 0, maxOffset);
+            const auto endOffset = std::clamp<uint64_t>(startOffset + lengthToWrite, 0, maxOffset);
+            const auto distance = gsl::narrow<size_t>(endOffset - startOffset);
+
+            // Calculate how many rows are in between startOffset (an inclusive coordinate) and endOffset (an exclusive one).
+            // We want to fully snapshot the row that startOffset and endOffset reside on. For startOffset we can just divide by w.
+            // For endOffset however, we need to add w to fully include it and subtract 1 because it's exclusive.
+            const auto rows = (endOffset + w - 1) / w - startOffset / w;
+
+            const auto viewport = Viewport::FromDimensions({ 0, startingCoordinate.y }, { bufferSize.Width(), gsl::narrow<til::CoordType>(rows) });
+            Viewport readViewport;
+
+            til::small_vector<CHAR_INFO, 1024> infos;
+            infos.resize(lengthToWrite, CHAR_INFO{ L' ', attribute });
+            RETURN_IF_FAILED(ReadConsoleOutputWImpl(OutContext, infos, viewport, readViewport));
+
+            bool anyChanged = false;
+            for (auto& info : infos)
+            {
+                anyChanged |= info.Attributes != attribute;
+                info.Attributes = attribute;
+            }
+
+            if (anyChanged)
+            {
+                Viewport writtenViewport;
+                RETURN_IF_FAILED(WriteConsoleOutputWImplHelper(OutContext, infos, viewport.Width(), readViewport, writtenViewport));
+            }
+
+            cellsModified = distance;
+        }
+        else
+        {
+            TextAttribute useThisAttr(attribute);
+            const OutputCellIterator it(useThisAttr, lengthToWrite);
+            const auto done = screenBuffer.Write(it, startingCoordinate);
+            const auto cellsModifiedCoord = done.GetCellDistance(it);
+
+            cellsModified = cellsModifiedCoord;
+        }
 
         if (screenBuffer.HasAccessibilityEventing())
         {
             // Notify accessibility
             auto endingCoordinate = startingCoordinate;
-            bufferSize.MoveInBounds(cellsModifiedCoord, endingCoordinate);
+            bufferSize.MoveInBounds(gsl::narrow<til::CoordType>(cellsModified), endingCoordinate);
             screenBuffer.NotifyAccessibilityEventing(startingCoordinate.x, startingCoordinate.y, endingCoordinate.x, endingCoordinate.y);
         }
     }
@@ -263,6 +304,8 @@ void WriteToScreen(SCREEN_INFORMATION& screenInfo, const Viewport& region)
     LockConsole();
     auto Unlock = wil::scope_exit([&] { UnlockConsole(); });
 
+    auto& gci = ServiceLocator::LocateGlobals().getConsoleInformation();
+
     // TODO: does this even need to be here or will it exit quickly?
     auto& screenInfo = OutContext.GetActiveBuffer();
     const auto bufferSize = screenInfo.GetBufferSize();
@@ -274,45 +317,85 @@ void WriteToScreen(SCREEN_INFORMATION& screenInfo, const Viewport& region)
     auto hr = S_OK;
     try
     {
-        const OutputCellIterator it(character, lengthToWrite);
-
-        // when writing to the buffer, specifically unset wrap if we get to the last column.
-        // a fill operation should UNSET wrap in that scenario. See GH #1126 for more details.
-        const auto done = screenInfo.Write(it, startingCoordinate, false);
-        const auto cellsModifiedCoord = done.GetInputDistance(it);
-
-        cellsModified = cellsModifiedCoord;
-
-        // Notify accessibility
-        if (screenInfo.HasAccessibilityEventing())
+        if (const auto io = gci.GetVtIo(&OutContext))
         {
-            auto endingCoordinate = startingCoordinate;
-            bufferSize.MoveInBounds(cellsModifiedCoord, endingCoordinate);
-            screenInfo.NotifyAccessibilityEventing(startingCoordinate.x, startingCoordinate.y, endingCoordinate.x, endingCoordinate.y);
-        }
-
-        // GH#3126 - This is a shim for powershell's `Clear-Host` function. In
-        // the vintage console, `Clear-Host` is supposed to clear the entire
-        // buffer. In conpty however, there's no difference between the viewport
-        // and the entirety of the buffer. We're going to see if this API call
-        // exactly matched the way we expect powershell to call it. If it does,
-        // then let's manually emit a ^[[3J to the connected terminal, so that
-        // their entire buffer will be cleared as well.
-        auto& gci = ServiceLocator::LocateGlobals().getConsoleInformation();
-        if (enablePowershellShim && gci.IsInVtIoMode())
-        {
-            const auto currentBufferDimensions{ screenInfo.GetBufferSize().Dimensions() };
-
-            const auto wroteWholeBuffer = lengthToWrite == (currentBufferDimensions.area<size_t>());
-            const auto startedAtOrigin = startingCoordinate == til::point{ 0, 0 };
-            const auto wroteSpaces = character == UNICODE_SPACE;
-
-            if (wroteWholeBuffer && startedAtOrigin && wroteSpaces)
+            // GH#3126 - This is a shim for powershell's `Clear-Host` function. In
+            // the vintage console, `Clear-Host` is supposed to clear the entire
+            // buffer. In conpty however, there's no difference between the viewport
+            // and the entirety of the buffer. We're going to see if this API call
+            // exactly matched the way we expect powershell to call it. If it does,
+            // then let's manually emit a Full Reset (RIS).
+            if (enablePowershellShim)
             {
-                // It's important that we flush the renderer at this point so we don't
-                // have any pending output rendered after the scrollback is cleared.
-                ServiceLocator::LocateGlobals().pRender->TriggerFlush(false);
-                hr = gci.GetVtIo()->ManuallyClearScrollback();
+                const auto currentBufferDimensions{ screenInfo.GetBufferSize().Dimensions() };
+
+                const auto wroteWholeBuffer = lengthToWrite == (currentBufferDimensions.area<size_t>());
+                const auto startedAtOrigin = startingCoordinate == til::point{ 0, 0 };
+                const auto wroteSpaces = character == UNICODE_SPACE;
+
+                if (wroteWholeBuffer && startedAtOrigin && wroteSpaces)
+                {
+                    WriteCharsVT(OutContext, L"\033c");
+                    cellsModified = lengthToWrite;
+                    return S_OK;
+                }
+            }
+
+            const auto corkLock = io->Cork();
+
+            const auto w = gsl::narrow_cast<uint64_t>(bufferSize.Width());
+            const auto h = gsl::narrow_cast<uint64_t>(bufferSize.Height());
+            const auto x = gsl::narrow_cast<uint64_t>(startingCoordinate.x);
+            const auto y = gsl::narrow_cast<uint64_t>(startingCoordinate.y);
+            const auto maxOffset = w * h;
+            const auto startOffset = std::clamp<uint64_t>(y * w + x, 0, maxOffset);
+            const auto endOffset = std::clamp<uint64_t>(startOffset + lengthToWrite, 0, maxOffset);
+            const auto distance = gsl::narrow<size_t>(endOffset - startOffset);
+
+            // Calculate how many rows are in between startOffset (an inclusive coordinate) and endOffset (an exclusive one).
+            // We want to fully snapshot the row that startOffset and endOffset reside on. For startOffset we can just divide by w.
+            // For endOffset however, we need to add w to fully include it and subtract 1 because it's exclusive.
+            const auto rows = (endOffset + w - 1) / w - startOffset / w;
+
+            const auto viewport = Viewport::FromDimensions({ 0, startingCoordinate.y }, { bufferSize.Width(), gsl::narrow<til::CoordType>(rows) });
+            Viewport readViewport;
+
+            til::small_vector<CHAR_INFO, 1024> infos;
+            infos.resize(lengthToWrite, CHAR_INFO{ character, FOREGROUND_BLUE | FOREGROUND_GREEN | FOREGROUND_RED });
+            RETURN_IF_FAILED(ReadConsoleOutputWImpl(OutContext, infos, viewport, readViewport));
+
+            bool anyChanged = false;
+            for (auto& info : infos)
+            {
+                anyChanged |= info.Char.UnicodeChar != character;
+                info.Char.UnicodeChar = character;
+            }
+
+            if (anyChanged)
+            {
+                Viewport writtenViewport;
+                RETURN_IF_FAILED(WriteConsoleOutputWImplHelper(OutContext, infos, viewport.Width(), readViewport, writtenViewport));
+            }
+
+            cellsModified = distance;
+        }
+        else
+        {
+            const OutputCellIterator it(character, lengthToWrite);
+
+            // when writing to the buffer, specifically unset wrap if we get to the last column.
+            // a fill operation should UNSET wrap in that scenario. See GH #1126 for more details.
+            const auto done = screenInfo.Write(it, startingCoordinate, false);
+            const auto cellsModifiedCoord = done.GetInputDistance(it);
+
+            cellsModified = cellsModifiedCoord;
+
+            // Notify accessibility
+            if (screenInfo.HasAccessibilityEventing())
+            {
+                auto endingCoordinate = startingCoordinate;
+                bufferSize.MoveInBounds(cellsModifiedCoord, endingCoordinate);
+                screenInfo.NotifyAccessibilityEventing(startingCoordinate.x, startingCoordinate.y, endingCoordinate.x, endingCoordinate.y);
             }
         }
     }
